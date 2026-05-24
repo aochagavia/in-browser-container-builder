@@ -39,7 +39,6 @@ interface Index {
 
 interface Manifest {
   schemaVersion: number;
-  mediaType?: string;
   config: Descriptor;
   layers: Descriptor[];
 }
@@ -47,8 +46,13 @@ interface Manifest {
 const OCI_INDEX_MEDIA_TYPE = 'application/vnd.oci.image.index.v1+json';
 const TARGET_OS = 'linux';
 const SUPPORTED_CPU_ARCHITECTURES = ['amd64', 'arm64'];
+const ENTRYPOINT_PATH = '/opt/aochagavia/entrypoint.sh';
 
-async function fetchManifest<T>(registry: string, repo: string, tagOrDigest: string): Promise<Response> {
+async function fetchManifest<T>(
+  registry: string,
+  repo: string,
+  tagOrDigest: string,
+): Promise<Response> {
   const url = `${registry}/v2/${repo}/manifests/${tagOrDigest}`;
   const res = await fetch(url);
   if (!res.ok) throw new Error(`Failed to fetch manifest: ${res.status} ${res.statusText}`);
@@ -84,6 +88,94 @@ async function sha256(bytes: Uint8Array): Promise<{ digest: string; hex: string 
     .map((b) => b.toString(16).padStart(2, '0'))
     .join('');
   return { digest: `sha256:${hex}`, hex };
+}
+
+async function gzip(bytes: Uint8Array): Promise<Uint8Array> {
+  const stream = new Blob([bytes as BlobPart]).stream().pipeThrough(new CompressionStream('gzip'));
+  return new Uint8Array(await new Response(stream).arrayBuffer());
+}
+
+interface EntrypointLayer {
+  uncompressedDigest: string;
+  compressedBytes: Uint8Array;
+  compressedDigest: string;
+  mediaType: string;
+}
+
+async function buildEntrypointLayer(script: string): Promise<EntrypointLayer> {
+  const scriptBytes = new TextEncoder().encode(script);
+  const layerTar = makeTar([
+    { name: ENTRYPOINT_PATH.replace(/^\//, ''), data: scriptBytes, mode: 0o755 },
+  ]);
+  const uncompressed = await sha256(layerTar);
+  const compressedBytes = await gzip(layerTar);
+  const compressed = await sha256(compressedBytes);
+  return {
+    uncompressedDigest: uncompressed.digest,
+    compressedBytes,
+    compressedDigest: compressed.digest,
+    mediaType: 'application/vnd.oci.image.layer.v1.tar+gzip',
+  };
+}
+
+async function buildNewImageMetadata(
+  baseImage: PlatformSpecificImage,
+  entrypointLayer: EntrypointLayer,
+): Promise<NewImageMetadata> {
+  // Add new layer to config (rootfs + history)
+  const config = JSON.parse(new TextDecoder().decode(baseImage.configBytes));
+  config.config = config.config ?? {};
+  config.config.Entrypoint = [ENTRYPOINT_PATH];
+  config.config.Cmd = [];
+  config.rootfs = config.rootfs ?? { type: 'layers', diff_ids: [] };
+  config.rootfs.diff_ids = [...(config.rootfs.diff_ids ?? []), entrypointLayer.uncompressedDigest];
+  config.history = [
+    ...(config.history ?? []),
+    {
+      created: new Date().toISOString(),
+      created_by: `entrypoint layer added in-browser`,
+    },
+  ];
+  const configBytes = new TextEncoder().encode(JSON.stringify(config));
+  const configHash = await sha256(configBytes);
+
+  // Add new layer to manifest
+  const manifest = JSON.parse(new TextDecoder().decode(baseImage.manifestBytes));
+  manifest.config = {
+    ...manifest.config,
+    digest: configHash.digest,
+    size: configBytes.length,
+  };
+  manifest.layers = [
+    ...manifest.layers,
+    {
+      mediaType: entrypointLayer.mediaType,
+      digest: entrypointLayer.compressedDigest,
+      size: entrypointLayer.compressedBytes.length,
+    },
+  ];
+  const manifestBytes = new TextEncoder().encode(JSON.stringify(manifest));
+  const manifestHash = await sha256(manifestBytes);
+  const manifestMediaType: string = manifest.mediaType ?? baseImage.manifestDescriptor.mediaType;
+
+  const layers = baseImage.manifest.layers.map((layer, i) => ({
+    digest: layer.digest,
+    bytes: baseImage.layerBytes[i],
+  }));
+  layers.push({
+    digest: entrypointLayer.compressedDigest,
+    bytes: entrypointLayer.compressedBytes,
+  });
+
+  return {
+    arch: baseImage.arch,
+    manifestBytes,
+    manifestMediaType,
+    manifestDigest: manifestHash.digest,
+    configBytes,
+    configDigest: configHash.digest,
+    layers,
+  };
 }
 
 export async function fetchIndex(registry: string, reference: Reference): Promise<Index> {
@@ -129,6 +221,16 @@ interface PlatformSpecificImage {
   layerBytes: Uint8Array[];
 }
 
+interface NewImageMetadata {
+  arch: string;
+  manifestBytes: Uint8Array;
+  manifestDigest: string;
+  manifestMediaType: string;
+  configBytes: Uint8Array;
+  configDigest: string;
+  layers: { digest: string; bytes: Uint8Array }[];
+}
+
 async function fetchPlatformSpecificImage(
   registry: string,
   baseImageReference: Reference,
@@ -138,7 +240,9 @@ async function fetchPlatformSpecificImage(
 ): Promise<PlatformSpecificImage> {
   const manifestDescriptor = findPlatformManifest(index, arch);
 
-  onLog(`\n\n[${arch}] Fetching base image manifest for ${arch} (${formatSize(manifestDescriptor.size)})...`);
+  onLog(
+    `\n\n[${arch}] Fetching base image manifest for ${arch} (${formatSize(manifestDescriptor.size)})...`,
+  );
   const manifestResponse = await fetchManifest(
     registry,
     baseImageReference.repo,
@@ -170,6 +274,7 @@ export async function buildImageAsDockerTar(
   registry: string,
   baseImageReference: Reference,
   finalImageReference: Reference,
+  entrypointScript: string,
   onLog: (msg: string) => void,
 ): Promise<Uint8Array> {
   onLog('Fetching base image index...');
@@ -178,17 +283,31 @@ export async function buildImageAsDockerTar(
 
   const platformSpecificImages: PlatformSpecificImage[] = [];
   for (const arch of SUPPORTED_CPU_ARCHITECTURES) {
-    platformSpecificImages.push(await fetchPlatformSpecificImage(registry, baseImageReference, baseImageIndex, arch, onLog));
+    platformSpecificImages.push(
+      await fetchPlatformSpecificImage(registry, baseImageReference, baseImageIndex, arch, onLog),
+    );
   }
 
-  // Build the multi-arch index referencing both platform manifests.
+  // Build the entrypoint layer once (the script is identical across architectures).
+  onLog(`\n\nBuilding entrypoint layer...`);
+  const entrypointLayer = await buildEntrypointLayer(entrypointScript);
+  onLog(` done (${formatSize(entrypointLayer.compressedBytes.length)}).`);
+
+  onLog('\nBuilding new image manifests and configs...');
+  const newImages: NewImageMetadata[] = [];
+  for (const img of platformSpecificImages) {
+    newImages.push(await buildNewImageMetadata(img, entrypointLayer));
+  }
+  onLog(' done.');
+
+  // Build the multi-arch index referencing the new image's manifests
   const newImageIndex = {
     schemaVersion: 2,
     mediaType: OCI_INDEX_MEDIA_TYPE,
-    manifests: platformSpecificImages.map(({ arch, manifestDescriptor }) => ({
-      mediaType: manifestDescriptor.mediaType,
-      digest: manifestDescriptor.digest,
-      size: manifestDescriptor.size,
+    manifests: newImages.map(({ arch, manifestMediaType, manifestDigest, manifestBytes }) => ({
+      mediaType: manifestMediaType,
+      digest: manifestDigest,
+      size: manifestBytes.length,
       platform: { os: TARGET_OS, architecture: arch },
     })),
   };
@@ -220,11 +339,11 @@ export async function buildImageAsDockerTar(
   // Collect all blobs, deduplicated by digest
   const blobsByDigest = new Map<string, Uint8Array>();
   blobsByDigest.set(newImageIndexHash.digest, newImageIndexBytes);
-  for (const { manifestDescriptor, manifestBytes, manifest, configBytes, layerBytes } of platformSpecificImages) {
-    blobsByDigest.set(manifestDescriptor.digest, manifestBytes);
-    blobsByDigest.set(manifest.config.digest, configBytes);
-    for (const [i, layer] of manifest.layers.entries()) {
-      blobsByDigest.set(layer.digest, layerBytes[i]);
+  for (const newImage of newImages) {
+    blobsByDigest.set(newImage.manifestDigest, newImage.manifestBytes);
+    blobsByDigest.set(newImage.configDigest, newImage.configBytes);
+    for (const layer of newImage.layers) {
+      blobsByDigest.set(layer.digest, layer.bytes);
     }
   }
 

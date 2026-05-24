@@ -16,12 +16,19 @@
   });
 
   const registry = 'https://pub-40af5d7df1e0402d9a92b982a6599860.r2.dev';
-  let baseImageReferenceRaw = $state('alpine:3.23.4');
+  const baseImages = [
+    'library/alpine:3.23.4',
+    'library/debian:3.15-slim',
+    'library/python:3.14.5-slim-trixie',
+  ];
+  let baseImageReferenceRaw = $state('library/alpine:3.23.4');
   let baseImageReference = $derived.by(() => fromRaw(baseImageReferenceRaw));
 
   let newImageReferenceRaw = $state('my-image:latest');
   let newImageReference = $derived.by(() => fromRaw(newImageReferenceRaw));
   let tarFilename = $derived.by(() => `${asRaw(newImageReference).replace(':', '_')}.tar`);
+
+  let entrypointScript = $state('#!/bin/sh\necho "Hello from a browser-built container!"');
 
   let status: Status = $state('idle');
   let buildLog: string = $state('');
@@ -32,9 +39,15 @@
     status = 'building';
 
     try {
-      tar = await buildImageAsDockerTar(registry, baseImageReference, newImageReference, (msg) => {
-        buildLog += msg;
-      });
+      tar = await buildImageAsDockerTar(
+        registry,
+        baseImageReference,
+        newImageReference,
+        entrypointScript,
+        (msg) => {
+          buildLog += msg;
+        },
+      );
       status = 'done';
     } catch (e) {
       status = 'error';
@@ -84,7 +97,11 @@
       <div class="flex flex-wrap items-end gap-2">
         <label class="form-control">
           <div class="label"><span class="label-text">Reference</span></div>
-          <input type="text" class="input-bordered input" bind:value={baseImageReferenceRaw} />
+          <select class="select-bordered select" bind:value={baseImageReferenceRaw}>
+            {#each baseImages as image}
+              <option value={image}>{image.replace(/^library\//, '')}</option>
+            {/each}
+          </select>
         </label>
       </div>
 
@@ -96,12 +113,19 @@
         </label>
       </div>
 
+      <div class="flex flex-wrap items-end gap-2">
+        <label class="form-control">
+          <div class="label"><span class="label-text">Entrypoint script</span></div>
+          <textarea
+            class="textarea-bordered textarea h-40 font-mono text-sm"
+            spellcheck="false"
+            bind:value={entrypointScript}
+          ></textarea>
+        </label>
+      </div>
+
       <div class="mt-6">
-        <button
-          class="btn btn-primary"
-          onclick={triggerBuild}
-          disabled={status === 'building'}
-        >
+        <button class="btn btn-primary" onclick={triggerBuild} disabled={status === 'building'}>
           {#if status === 'building'}
             <span class="loading loading-sm loading-spinner"></span>
           {/if}
