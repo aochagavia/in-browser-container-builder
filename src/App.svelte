@@ -60,8 +60,8 @@
   }
 </script>
 
-<main class="mx-auto max-w-4xl space-y-6 p-6">
-  <header class="flex items-start justify-between gap-4">
+<main class="mx-auto max-w-4xl space-y-6 px-0 py-6 sm:p-6">
+  <header class="flex items-start justify-between gap-4 px-6 sm:px-0">
     <div>
       <h1 class="text-3xl font-bold">In-browser container builder</h1>
       <p class="text-base-content/70">Build a container image and download it as a tar archive</p>
@@ -93,8 +93,14 @@
 
   <section class="card bg-base-200">
     <div class="card-body">
-      <h2 class="mt-6 card-title">Base image</h2>
+      <h2 class="card-title">Base image</h2>
       <div class="flex flex-wrap items-end gap-2">
+        <p class="max-w-prose text-sm text-base-content/60">
+          Note: we only support a fixed set of base images, because the browser blocks direct
+          requests to DockerHub. The images listed in the dropdown below have been mirrored to a
+          registry that responds with the right CORS headers to allow pulling from the browser.
+        </p>
+
         <label class="form-control">
           <div class="label"><span class="label-text">Reference</span></div>
           <select class="select-bordered select" bind:value={baseImageReferenceRaw}>
@@ -105,7 +111,7 @@
         </label>
       </div>
 
-      <h2 class="mt-6 card-title">New image</h2>
+      <h2 class="mt-2 card-title">New image</h2>
       <div class="flex flex-wrap items-end gap-2">
         <label class="form-control">
           <div class="label"><span class="label-text">Reference</span></div>
@@ -114,17 +120,17 @@
       </div>
 
       <div class="flex flex-wrap items-end gap-2">
-        <label class="form-control">
+        <label class="form-control w-[80ch] max-w-full">
           <div class="label"><span class="label-text">Entrypoint script</span></div>
           <textarea
-            class="textarea-bordered textarea h-40 font-mono text-sm"
+            class="textarea-bordered textarea h-24 w-full font-mono text-sm"
             spellcheck="false"
             bind:value={entrypointScript}
           ></textarea>
         </label>
       </div>
 
-      <div class="mt-6">
+      <div class="mt-2">
         <button class="btn btn-primary" onclick={triggerBuild} disabled={status === 'building'}>
           {#if status === 'building'}
             <span class="loading loading-sm loading-spinner"></span>
@@ -161,4 +167,8 @@
       </div>
     </section>
   {/if}
+
+  <footer class="px-6 pt-4 text-center text-sm text-base-content/60 sm:px-0">
+    Built with love by <a href="https://ochagavia.nl" class="link">Adolfo Ochagavía</a>
+  </footer>
 </main>
