@@ -18,7 +18,7 @@
   const registry = 'https://pub-40af5d7df1e0402d9a92b982a6599860.r2.dev';
   const baseImages = [
     'library/alpine:3.23.4',
-    'library/debian:3.15-slim',
+    'library/debian:13.5-slim',
     'library/python:3.14.5-slim-trixie',
   ];
   let baseImageReferenceRaw = $state('library/alpine:3.23.4');
