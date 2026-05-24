@@ -1,22 +1,7 @@
 <script lang="ts">
-  import {
-    asRaw,
-    buildTar,
-    fetchIndex,
-    fetchPlatformManifest,
-    findPlatformManifest,
-    formatSize,
-    fromRaw,
-    triggerDownload,
-    type Descriptor,
-    type Index,
-    type Manifest,
-    type Reference,
-  } from './lib/oci';
+  import { asRaw, buildImageAsDockerTar, fromRaw, triggerDownload } from './lib/oci';
 
-  type Status = 'idle' | 'loading' | 'ready' | 'error';
-  type BuildStatus = 'idle' | 'building' | 'done' | 'error';
-
+  type Status = 'idle' | 'building' | 'done' | 'error';
   type Theme = 'light' | 'dark';
 
   const initialTheme: Theme =
@@ -30,63 +15,35 @@
     document.documentElement.setAttribute('data-theme', theme);
   });
 
-  let cpu_arch = $state('amd64');
-  let registry = $state('https://pub-40af5d7df1e0402d9a92b982a6599860.r2.dev');
-  let reference_raw = $state('cowsay:latest');
-  let reference = $derived.by(() => fromRaw(reference_raw));
+  const registry = 'https://pub-40af5d7df1e0402d9a92b982a6599860.r2.dev';
+  let baseImageReferenceRaw = $state('alpine:3.23.4');
+  let baseImageReference = $derived.by(() => fromRaw(baseImageReferenceRaw));
 
-  let final_reference_raw = $state('cowsay-custom:latest');
-  let final_reference = $derived.by(() => fromRaw(final_reference_raw));
+  let newImageReferenceRaw = $state('my-image:latest');
+  let newImageReference = $derived.by(() => fromRaw(newImageReferenceRaw));
+  let tarFilename = $derived.by(() => `${asRaw(newImageReference).replace(':', '_')}.tar`);
 
   let status: Status = $state('idle');
   let buildLog: string = $state('');
-
-  let index: Index | null = $state(null);
-  let match: Descriptor | null = $state(null);
-  let manifest: Manifest | null = $state(null);
-
-  let buildStatus: BuildStatus = $state('idle');
-  let buildResultBytes = $state(0);
-  let tarFilename = $state('');
   let tar: Uint8Array = new Uint8Array();
 
-  async function pull() {
-    buildLog = 'Fetching image index...';
-    index = null;
-    match = null;
-    manifest = null;
-    status = 'loading';
-    buildStatus = 'idle';
-    tarFilename = `${asRaw(final_reference).replace(':', '_')}.tar`;
+  async function triggerBuild() {
+    buildLog = '';
+    status = 'building';
 
     try {
-      index = await fetchIndex(registry, reference);
-      buildLog += ` done.\nChecking support for ${cpu_arch}...`;
-
-      match = findPlatformManifest(index, cpu_arch);
-      buildLog += ` done.\nFetching platform manifest...`;
-
-      manifest = await fetchPlatformManifest(registry, reference.repo, match.digest);
-      buildLog += ` done.`;
-
-      tar = await buildTar(registry, reference.repo, final_reference, manifest, (msg) => {
+      tar = await buildImageAsDockerTar(registry, baseImageReference, newImageReference, (msg) => {
         buildLog += msg;
       });
-      buildResultBytes = tar.length;
-
-      buildLog += `\nImage built (${formatSize(buildResultBytes)}).`;
-      buildStatus = 'done';
-
-      status = 'ready';
+      status = 'done';
     } catch (e) {
       status = 'error';
-      buildLog += ` error:\n${e instanceof Error ? e.message : String(e)}`;
+      buildLog += `\nError:\n${e instanceof Error ? e.message : String(e)}`;
     }
   }
 
   function download() {
-    const filename = `${asRaw(final_reference).replace(':', '_')}.tar`;
-    triggerDownload(tar, filename);
+    triggerDownload(tar, tarFilename);
   }
 </script>
 
@@ -123,28 +80,11 @@
 
   <section class="card bg-base-200">
     <div class="card-body">
-      <h2 class="card-title">Target runtime</h2>
-      <div class="flex flex-wrap items-end gap-2">
-        <label class="form-control">
-          <div class="label"><span class="label-text">CPU Architecture</span></div>
-          <select class="select-bordered select" bind:value={cpu_arch}>
-            <option value="amd64">amd64</option>
-            <option value="arm64">arm64</option>
-          </select>
-        </label>
-      </div>
-
       <h2 class="mt-6 card-title">Base image</h2>
       <div class="flex flex-wrap items-end gap-2">
         <label class="form-control">
-          <div class="label"><span class="label-text">Registry</span></div>
-          <input type="text" class="input-bordered input" bind:value={registry} />
-        </label>
-      </div>
-      <div class="flex flex-wrap items-end gap-2">
-        <label class="form-control">
           <div class="label"><span class="label-text">Reference</span></div>
-          <input type="text" class="input-bordered input" bind:value={reference_raw} />
+          <input type="text" class="input-bordered input" bind:value={baseImageReferenceRaw} />
         </label>
       </div>
 
@@ -152,17 +92,17 @@
       <div class="flex flex-wrap items-end gap-2">
         <label class="form-control">
           <div class="label"><span class="label-text">Reference</span></div>
-          <input type="text" class="input-bordered input" bind:value={final_reference_raw} />
+          <input type="text" class="input-bordered input" bind:value={newImageReferenceRaw} />
         </label>
       </div>
 
       <div class="mt-6">
         <button
           class="btn btn-primary"
-          onclick={pull}
-          disabled={status === 'loading' || !reference_raw}
+          onclick={triggerBuild}
+          disabled={status === 'building'}
         >
-          {#if status === 'loading'}
+          {#if status === 'building'}
             <span class="loading loading-sm loading-spinner"></span>
           {/if}
           Build
@@ -179,19 +119,19 @@
 
         <h2 class="mt-6 card-title">Download</h2>
         <div>
-          <button class="btn btn-primary" onclick={download} disabled={buildStatus !== 'done'}>
-            {#if buildStatus === 'building'}
+          <button class="btn btn-primary" onclick={download} disabled={status !== 'done'}>
+            {#if status === 'building'}
               <span class="loading loading-sm loading-spinner"></span>
             {/if}
-            Download {asRaw(final_reference).replace(':', '_')}.tar
+            Download {asRaw(newImageReference).replace(':', '_')}.tar
           </button>
         </div>
 
-        {#if buildStatus === 'done'}
+        {#if status === 'done'}
           <h2 class="mt-6 card-title">Run instructions</h2>
           <p>After downloading, you can run the image as follows:</p>
           <pre class="overflow-x-auto rounded bg-base-300 p-4 text-sm"><code
-              >{`docker load -i ${tarFilename}\ndocker run --rm ${final_reference_raw}`}</code
+              >{`docker load -i ${tarFilename}\ndocker run --rm ${newImageReferenceRaw}`}</code
             ></pre>
         {/if}
       </div>

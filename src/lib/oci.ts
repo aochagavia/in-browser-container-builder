@@ -1,7 +1,5 @@
 import { makeTar, type TarFile } from './tar';
 
-export const TARGET_OS = 'linux';
-
 export interface Reference {
   repo: string;
   tag: string;
@@ -26,37 +24,41 @@ export function fromRaw(raw: string): Reference {
   };
 }
 
-export interface Descriptor {
+interface Descriptor {
   mediaType: string;
   digest: string;
   size: number;
   platform?: { os: string; architecture: string; variant?: string };
 }
 
-export interface Index {
+interface Index {
   schemaVersion: number;
   mediaType?: string;
   manifests: Descriptor[];
 }
 
-export interface Manifest {
+interface Manifest {
   schemaVersion: number;
   mediaType?: string;
   config: Descriptor;
   layers: Descriptor[];
 }
 
-async function fetchManifest<T>(registry: string, repo: string, tagOrDigest: string): Promise<T> {
+const OCI_INDEX_MEDIA_TYPE = 'application/vnd.oci.image.index.v1+json';
+const TARGET_OS = 'linux';
+const SUPPORTED_CPU_ARCHITECTURES = ['amd64', 'arm64'];
+
+async function fetchManifest<T>(registry: string, repo: string, tagOrDigest: string): Promise<Response> {
   const url = `${registry}/v2/${repo}/manifests/${tagOrDigest}`;
   const res = await fetch(url);
-  if (!res.ok) throw new Error(`Manifest request failed: ${res.status} ${res.statusText}`);
-  return (await res.json()) as T;
+  if (!res.ok) throw new Error(`Failed to fetch manifest: ${res.status} ${res.statusText}`);
+  return res;
 }
 
 async function fetchBlob(registry: string, repo: string, digest: string): Promise<Uint8Array> {
   const url = `${registry}/v2/${repo}/blobs/${digest}`;
   const res = await fetch(url);
-  if (!res.ok) throw new Error(`Blob request failed: ${res.status} ${res.statusText} (${digest})`);
+  if (!res.ok) throw new Error(`Failed to fetch blob: ${res.status} ${res.statusText} (${digest})`);
   return new Uint8Array(await res.arrayBuffer());
 }
 
@@ -71,79 +73,173 @@ export function formatSize(bytes: number): string {
   return `${value.toFixed(2)} ${units[unit]}`;
 }
 
-function digestHex(digest: string): string {
+function stripDigestPrefix(digest: string): string {
   const idx = digest.indexOf(':');
   return idx === -1 ? digest : digest.slice(idx + 1);
 }
 
-export async function fetchIndex(registry: string, reference: Reference): Promise<Index> {
-  return fetchManifest<Index>(registry, reference.repo, reference.tag);
+async function sha256(bytes: Uint8Array): Promise<{ digest: string; hex: string }> {
+  const hash = await crypto.subtle.digest('SHA-256', bytes as BufferSource);
+  const hex = Array.from(new Uint8Array(hash))
+    .map((b) => b.toString(16).padStart(2, '0'))
+    .join('');
+  return { digest: `sha256:${hex}`, hex };
 }
 
-export function findPlatformManifest(index: Index, arch: any): Descriptor {
-  const os = TARGET_OS;
+export async function fetchIndex(registry: string, reference: Reference): Promise<Index> {
+  const index = await fetchManifest<Index>(registry, reference.repo, reference.tag);
+  return await index.json();
+}
+
+// Expand an image reference to its fully-qualified canonical form
+// (e.g. `my-image:latest` -> `docker.io/library/my-image:latest`).
+// This is necessary for `docker load -i <image>` to work properly.
+function canonicalImageReference(ref: Reference): string {
+  let repo = ref.repo;
+  const firstSlash = repo.indexOf('/');
+  if (firstSlash === -1) {
+    repo = `docker.io/library/${repo}`;
+  } else {
+    const firstPart = repo.slice(0, firstSlash);
+    const isRegistry =
+      firstPart.includes('.') || firstPart.includes(':') || firstPart === 'localhost';
+    if (!isRegistry) {
+      repo = `docker.io/${repo}`;
+    }
+  }
+  return `${repo}:${ref.tag}`;
+}
+
+export function findPlatformManifest(index: Index, arch: string): Descriptor {
   const match = index.manifests.find(
-    (m) => m.platform?.os === os && m.platform?.architecture === arch && !m.platform?.variant,
+    (m) => m.platform?.os === TARGET_OS && m.platform?.architecture === arch,
   );
   if (!match) {
-    throw new Error(`No manifest for ${os}/${arch} found in index`);
+    throw new Error(`No manifest for ${TARGET_OS}/${arch} found in the base image's index`);
   }
   return match;
 }
 
-export async function fetchPlatformManifest(
-  registry: string,
-  repo: string,
-  digest: string,
-): Promise<Manifest> {
-  return fetchManifest<Manifest>(registry, repo, digest);
+interface PlatformSpecificImage {
+  arch: string;
+  manifestDescriptor: Descriptor;
+  manifestBytes: Uint8Array;
+  manifest: Manifest;
+  configBytes: Uint8Array;
+  layerBytes: Uint8Array[];
 }
 
-export async function buildTar(
+async function fetchPlatformSpecificImage(
   registry: string,
-  base_image_repo: string,
-  final_image_reference: Reference,
-  manifest: Manifest,
+  baseImageReference: Reference,
+  index: Index,
+  arch: string,
   onLog: (msg: string) => void,
-): Promise<Uint8Array> {
-  const configHex = digestHex(manifest.config.digest);
-  const layerHexes = manifest.layers.map((l) => digestHex(l.digest));
+): Promise<PlatformSpecificImage> {
+  const manifestDescriptor = findPlatformManifest(index, arch);
 
-  onLog(`\nFetching config blob (${formatSize(manifest.config.size)})...`);
-  const configBytes = await fetchBlob(registry, base_image_repo, manifest.config.digest);
-  onLog(` done.`);
+  onLog(`\n\n[${arch}] Fetching base image manifest for ${arch} (${formatSize(manifestDescriptor.size)})...`);
+  const manifestResponse = await fetchManifest(
+    registry,
+    baseImageReference.repo,
+    manifestDescriptor.digest,
+  );
+  const manifestBytes = new Uint8Array(await manifestResponse.arrayBuffer());
+  const manifest = JSON.parse(new TextDecoder().decode(manifestBytes)) as Manifest;
+  onLog(' done.');
+
+  onLog(`\n[${arch}] Fetching base image config blob (${formatSize(manifest.config.size)})...`);
+  const configBytes = await fetchBlob(registry, baseImageReference.repo, manifest.config.digest);
+  onLog(' done.');
 
   const layerBytes: Uint8Array[] = [];
   for (const [i, layer] of manifest.layers.entries()) {
-    onLog(`\nFetching layer ${i + 1} of ${manifest.layers.length} (${formatSize(layer.size)})...`);
-    layerBytes.push(await fetchBlob(registry, base_image_repo, layer.digest));
+    onLog(
+      `\n[${arch}] Fetching base image layer ${i + 1} of ${manifest.layers.length} (${formatSize(layer.size)})...`,
+    );
+    layerBytes.push(await fetchBlob(registry, baseImageReference.repo, layer.digest));
     onLog(' done.');
   }
 
-  const dockerManifest = [
-    {
-      Config: `blobs/sha256/${configHex}`,
-      RepoTags: [`${final_image_reference.repo}:${final_image_reference.tag}`],
-      Layers: layerHexes.map((h) => `blobs/sha256/${h}`),
-    },
-  ];
+  return { arch, manifestDescriptor, manifestBytes, manifest, configBytes, layerBytes };
+}
 
-  const encoder = new TextEncoder();
+// Build a multi-arch container image and package it as an OCI image layout in a tar archive
+// (to be loaded through `docker load -i <file>`)
+export async function buildImageAsDockerTar(
+  registry: string,
+  baseImageReference: Reference,
+  finalImageReference: Reference,
+  onLog: (msg: string) => void,
+): Promise<Uint8Array> {
+  onLog('Fetching base image index...');
+  const baseImageIndex = await fetchIndex(registry, baseImageReference);
+  onLog(' done.');
+
+  const platformSpecificImages: PlatformSpecificImage[] = [];
+  for (const arch of SUPPORTED_CPU_ARCHITECTURES) {
+    platformSpecificImages.push(await fetchPlatformSpecificImage(registry, baseImageReference, baseImageIndex, arch, onLog));
+  }
+
+  // Build the multi-arch index referencing both platform manifests.
+  const newImageIndex = {
+    schemaVersion: 2,
+    mediaType: OCI_INDEX_MEDIA_TYPE,
+    manifests: platformSpecificImages.map(({ arch, manifestDescriptor }) => ({
+      mediaType: manifestDescriptor.mediaType,
+      digest: manifestDescriptor.digest,
+      size: manifestDescriptor.size,
+      platform: { os: TARGET_OS, architecture: arch },
+    })),
+  };
+  const newImageIndexBytes = new TextEncoder().encode(JSON.stringify(newImageIndex));
+  const newImageIndexHash = await sha256(newImageIndexBytes);
+  const newImageReference = canonicalImageReference(finalImageReference);
+
+  // This additional tar index is what tells Docker how to import the image (e.g., the image's tag)
+  const tarIndex = {
+    schemaVersion: 2,
+    mediaType: OCI_INDEX_MEDIA_TYPE,
+    manifests: [
+      {
+        mediaType: OCI_INDEX_MEDIA_TYPE,
+        digest: newImageIndexHash.digest,
+        size: newImageIndexBytes.length,
+        annotations: {
+          'io.containerd.image.name': newImageReference,
+          'org.opencontainers.image.ref.name': finalImageReference.tag,
+        },
+      },
+    ],
+  };
+  const tarIndexBytes = new TextEncoder().encode(JSON.stringify(tarIndex, null, 2));
+  const ociLayoutBytes = new TextEncoder().encode(
+    JSON.stringify({ imageLayoutVersion: '1.0.0' }, null, 2),
+  );
+
+  // Collect all blobs, deduplicated by digest
+  const blobsByDigest = new Map<string, Uint8Array>();
+  blobsByDigest.set(newImageIndexHash.digest, newImageIndexBytes);
+  for (const { manifestDescriptor, manifestBytes, manifest, configBytes, layerBytes } of platformSpecificImages) {
+    blobsByDigest.set(manifestDescriptor.digest, manifestBytes);
+    blobsByDigest.set(manifest.config.digest, configBytes);
+    for (const [i, layer] of manifest.layers.entries()) {
+      blobsByDigest.set(layer.digest, layerBytes[i]);
+    }
+  }
+
   const files: TarFile[] = [
-    {
-      name: 'manifest.json',
-      data: encoder.encode(JSON.stringify(dockerManifest, null, 2)),
-    },
-    { name: `blobs/sha256/${configHex}`, data: configBytes },
-    ...manifest.layers.map((_, i) => ({
-      name: `blobs/sha256/${layerHexes[i]}`,
-      data: layerBytes[i],
+    { name: 'oci-layout', data: ociLayoutBytes },
+    { name: 'index.json', data: tarIndexBytes },
+    ...Array.from(blobsByDigest.entries()).map(([digest, data]) => ({
+      name: `blobs/sha256/${stripDigestPrefix(digest)}`,
+      data,
     })),
   ];
 
-  onLog('\nPacking tar...');
+  onLog('\n\nPacking multi-platform image as a docker-compatible tar archive...');
   const tar = makeTar(files);
-  onLog(' done.');
+  onLog(` done.\nImage built (${formatSize(tar.length)}).`);
 
   return tar;
 }
