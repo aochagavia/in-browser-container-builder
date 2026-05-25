@@ -94,13 +94,12 @@
   <section class="card bg-base-200">
     <div class="card-body">
       <h2 class="card-title">Base image</h2>
+      <p class="max-w-prose text-sm text-base-content/60">
+        Note: we only support a fixed set of base images, because the browser blocks direct
+        requests to DockerHub. The images listed in the dropdown below have been mirrored to a
+        registry that responds with the right CORS headers to allow pulling from the browser.
+      </p>
       <div class="flex flex-wrap items-end gap-2">
-        <p class="max-w-prose text-sm text-base-content/60">
-          Note: we only support a fixed set of base images, because the browser blocks direct
-          requests to DockerHub. The images listed in the dropdown below have been mirrored to a
-          registry that responds with the right CORS headers to allow pulling from the browser.
-        </p>
-
         <label class="form-control">
           <div class="label"><span class="label-text">Reference</span></div>
           <select class="select-bordered select" bind:value={baseImageReferenceRaw}>
